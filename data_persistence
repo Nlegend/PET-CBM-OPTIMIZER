@@ -1,0 +1,83 @@
+# data_persistence.py
+import json
+from pathlib import Path
+import numpy as np
+from typing import Dict, Any, Optional, Tuple, List
+
+class KFactorStore:
+    def __init__(self, store_file: str = "k_store.json") -> None:
+        self.store_file = Path(store_file)
+
+    def load_store(self) -> Dict[str, List[float]]:
+        """Carga el diccionario { '<tracer>_<recon>': [k1, k2, ...] }."""
+        try:
+            if self.store_file.exists():
+                text = self.store_file.read_text(encoding="utf-8")
+                data = json.loads(text) if text.strip() else {}
+                # normaliza a listas de float
+                for k, v in list(data.items()):
+                    if not isinstance(v, list):
+                        data[k] = []
+                    else:
+                        data[k] = [float(x) for x in v if self._is_number(x)]
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def save_store(self, store: Dict[str, List[float]]) -> None:
+        """Guarda el diccionario de k en disco."""
+        try:
+            self.store_file.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except Exception:
+            # Evita romper el flujo si hay un error de IO
+            pass
+
+    def add_k_measurement(
+        self,
+        store: Dict[str, List[float]],
+        tracer: str,
+        recon_profile: str,
+        k_value: float
+    ) -> Dict[str, List[float]]:
+        """Agrega un valor de k al arreglo correspondiente y persiste."""
+        key = f"{tracer}_{recon_profile}"
+        arr = store.get(key, [])
+        arr.append(float(k_value))
+        store[key] = arr
+        self.save_store(store)
+        return store
+
+    def summarize_k(
+        self,
+        store: Dict[str, List[float]],
+        tracer: str,
+        recon_profile: str
+    ) -> Optional[Tuple[float, float, float, int]]:
+        """
+        Devuelve (mediana, p25, p75, n) para <tracer>_<recon_profile> o None si no hay datos.
+        """
+        key = f"{tracer}_{recon_profile}"
+        vals = store.get(key, [])
+        if not vals:
+            return None
+        a = np.array(vals, dtype=float)
+        return (
+            float(np.median(a)),
+            float(np.percentile(a, 25)),
+            float(np.percentile(a, 75)),
+            int(len(a)),
+        )
+
+    def get_site_k_summary(self, tracer: str, recon_profile: str) -> Optional[Tuple[float, float, float, int]]:
+        """Conveniencia: carga de disco y resume."""
+        store = self.load_store()
+        return self.summarize_k(store, tracer, recon_profile)
+
+    @staticmethod
+    def _is_number(x: Any) -> bool:
+        try:
+            float(x)
+            return True
+        except Exception:
+            return False
