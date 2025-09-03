@@ -1,0 +1,231 @@
+import numpy as np
+from datetime import datetime
+
+class PETPhysicsModel:
+    """
+    Modelo físico para planificación PET/CT (Biograph Vision 450).
+    - Sensibilidad base (literatura): 9.1 kcps/MBq para F-18.
+    - SNR ∝ sqrt(cuentas) * gain.
+    - k se calibra con sensibilidad base y SIN BMI (propiedad del sitio/recon).
+    - El efecto del tamaño del paciente se aplica SOLO una vez vía mult_BMI en los solvers.
+    """
+
+    def __init__(self):
+        # Geometría Vision 450
+        self.AXFOV_MM = 263.0  # mm (26.3 cm)
+
+        # Vida media (min)
+        self.HALF_LIFE_MIN = {
+            "FDG": 109.77,          # F-18
+            "PSMA": 109.77,         # F-18 PSMA-1007
+        }
+
+        # SNR objetivo por defecto (caso) y SNR de referencia del sitio (para calibrar k)
+        self.SNR_TARGET_DEFAULT = {"FDG": 12.0, "PSMA": 14.0}
+        self.SNR_REF_SITE_DEFAULT = {"FDG": 12.0, "PSMA": 14.0}
+
+        # Perfiles de reconstrucción → ganancia efectiva (editable por sitio)
+        self.RECON_PROFILES = {
+            "EARL": {"gain": 1.0, "note": "EARL armonizado"},
+            "OSEM_TOF": {"gain": 1.25, "note": "OSEM+TOF sin PSF"},
+            "HD_PET": {"gain": 1.6, "note": "TOF+PSF+filtro (Vision)"},
+        }
+
+        # Sensibilidad del sistema (literatura, F-18). Base SIN corrección por tamaño.
+        # 9.1 cps/KBq = 9100 cps/MBq
+        self.SYSTEM_SENSITIVITY_CPS_PER_MBQ = 9.1 * 1000.0
+
+        # Clasificación BMI (por si se necesita informar estado)
+        self.BMI_CATEGORIES = {
+            "underweight": (0, 18.5),
+            "normal": (18.5, 25.0),
+            "overweight": (25.0, 30.0),
+            "obese_class_i": (30.0, 35.0),
+            "obese_class_ii": (35.0, 40.0),
+            "obese_class_iii": (40.0, 100.0),
+        }
+
+    # ----------------------------
+    # Utilidades básicas
+    # ----------------------------
+    def tracer_key(self, name: str) -> str:
+        return "PSMA" if "PSMA" in str(name).upper() else "FDG"
+
+    def get_reconstruction_gain(self, profile: str, custom_gain: float | None = None) -> float:
+        """Devuelve la ganancia de reconstrucción (editable)."""
+        if custom_gain is not None and custom_gain > 0:
+            return float(custom_gain)
+        return self.RECON_PROFILES.get(profile, {"gain": 1.6})["gain"]
+
+    def recon_gain_val(self, profile: str, custom_gain: float | None = None) -> float:
+        """Alias por compatibilidad con el main."""
+        return self.get_reconstruction_gain(profile, custom_gain)
+
+    def calculate_lbm(self, weight_kg: float, height_cm: float, gender: str = 'male') -> float:
+        gender = (gender or 'male').lower()
+        if gender in ['male', 'masculino', 'hombre']:
+            lbm = 1.10 * weight_kg - 128 * (weight_kg / height_cm) ** 2
+        else:
+            lbm = 1.07 * weight_kg - 148 * (weight_kg / height_cm) ** 2
+        return max(lbm, 30.0)
+
+    def bmi_multiplier(self, bmi: float, tracer: str = 'FDG', bmi_ref: float | None = None,
+                       bmi_cap: float = 40.0) -> float:
+        """
+        ÚNICO lugar para aplicar tamaño del paciente en los solvers.
+        Sugerencia sitio: exp_FDG=0.6, exp_PSMS=0.4; cap BMI a 40.
+        """
+        if bmi_ref is None:
+            bmi_ref = 22.0
+        tkey = self.tracer_key(tracer)
+        exp = 0.6 if tkey == "FDG" else 0.4
+        bmi_eff = min(float(bmi), bmi_cap)
+        return 1.0 if bmi_eff <= bmi_ref else (bmi_eff / bmi_ref) ** exp
+
+    def effective_activity_mbq(self, injected_mbq: float, inj_time: datetime, scan_start: datetime,
+                               tracer: str = "FDG", residual_mbq: float = 0.0) -> float:
+        """
+        Actividad efectiva a inicio de adquisición: (inyectada - residual) * exp(-λ Δt)
+        """
+        half_life = self.HALF_LIFE_MIN[self.tracer_key(tracer)]
+        lam = np.log(2) / half_life
+        dt_min = max((scan_start - inj_time).total_seconds() / 60.0, 0.0)
+        A0 = max(injected_mbq - residual_mbq, 0.0)
+        return float(A0 * np.exp(-lam * dt_min))
+
+    # ----------------------------
+    # Cuentas esperadas y SNR
+    # ----------------------------
+    def system_sensitivity(self, tracer: str = "FDG") -> float:
+        """
+        Sensibilidad base del sistema (cps/MBq) sin corrección por tamaño.
+        Si deseas una variante con factor de tamaño en sensibilidad (en vez de BMI en solver),
+        podrías introducirla aquí como opción, pero por defecto NO se usa.
+        """
+        _ = self.tracer_key(tracer)  # reservado por si en futuro varía por trazador F-18 vs Ga-68
+        return float(self.SYSTEM_SENSITIVITY_CPS_PER_MBQ)
+
+    def expected_counts(self, activity_mbq: float, dwell_time_s: float, tracer: str = "FDG") -> float:
+        """
+        Cuentas esperadas = A (MBq) × t (s) × sensibilidad (cps/MBq).
+        Nota: Esto NO es NECR; es un proxy de cuentas útiles. NECR real requiere T,S,R y tiempos muertos.
+        """
+        sens = self.system_sensitivity(tracer)
+        return float(max(activity_mbq, 0.0) * max(dwell_time_s, 0.0) * sens)
+
+    # Alias para compatibilidad (antes llamábamos "NEC" a las cuentas esperadas)
+    def calculate_nec(self, activity_mbq: float, dwell_time_s: float, tracer: str = "FDG") -> float:
+        """DEPRECATED alias: usar expected_counts()."""
+        return self.expected_counts(activity_mbq, dwell_time_s, tracer)
+
+    def snr_from_counts(self, counts: float, recon_gain: float = 1.0) -> float:
+        """SNR = sqrt(cuentas) * gain."""
+        return float(np.sqrt(max(counts, 1e-12)) * max(recon_gain, 1e-12))
+
+    # ----------------------------
+    # Calibración de k (del sitio)
+    # ----------------------------
+    def calibrate_k_from_reference(self, t_ref_std_s: float, A_ref_mbq: float,
+                                   recon_gain: float, snr_ref_site: float,
+                                   tracer: str = "FDG") -> float:
+        """
+        k = SNR_ref_site / ( sqrt(A_ref * t_ref * sensitivity_base) * gain )
+        - Sensibilidad base SIN tamaño ni BMI.
+        - NO aplicar BMI aquí (k debe ser propiedad del sitio/recon).
+        """
+        sens_base = self.system_sensitivity(tracer)
+        counts_ref = max(A_ref_mbq * t_ref_std_s * sens_base, 1e-12)
+        k = snr_ref_site / (np.sqrt(counts_ref) * max(recon_gain, 1e-12))
+        return float(max(k, 1e-12))
+
+    # ----------------------------
+    # Solvers (coherentes con el main)
+    # ----------------------------
+    def _round_speed_and_time(self, t_bed_s: float):
+        """Redondeo de velocidad a 0.1 mm/s, con caps [0.5, 50] mm/s, y t_bed recalculado por AFOV."""
+        v = self.AXFOV_MM / max(t_bed_s, 1e-9)
+        v = max(0.5, min(v, 50.0))
+        v = round(v, 1)  # consola Vision: 1 decimal
+        t_bed_r = self.AXFOV_MM / v
+        return v, t_bed_r
+
+    def solve_standard(self, A_eff_mbq: float, k: float, recon_gain: float,
+                       snr_target_case: float, mult_bmi: float, scan_range_mm: float,
+                       tracer: str = "FDG"):
+        """
+        Requiere cuentas: C_req = (SNR_target / (k*gain))^2
+        t_bed = C_req / (A_eff * sensitivity_base) * mult_BMI
+        """
+        counts_req = (snr_target_case / (max(k, 1e-12) * max(recon_gain, 1e-12))) ** 2
+        sens = self.system_sensitivity(tracer)
+        t_bed = counts_req / max(A_eff_mbq * sens, 1e-9) * max(mult_bmi, 1e-12)
+
+        v, t_bed_r = self._round_speed_and_time(t_bed)
+
+        counts_act = self.expected_counts(A_eff_mbq, t_bed_r, tracer)
+        snr_pred = k * self.snr_from_counts(counts_act, recon_gain)
+        cov_pred = 1.0 / snr_pred if snr_pred > 0 else np.nan
+        hit = abs(snr_pred - snr_target_case) <= 0.3
+
+        time_min = (scan_range_mm / v) / 60.0
+        return v, t_bed_r, time_min, snr_pred, cov_pred, hit
+
+    def solve_lowdose(self, low_dpk: float, weight_kg: float, k: float, recon_gain: float,
+                      snr_target_case: float, mult_bmi: float, scan_range_mm: float,
+                      tracer: str = "FDG"):
+        """
+        A_low = low_dpk * weight
+        t_bed = C_req / (A_low * sensitivity_base) * mult_BMI
+        """
+        A_low = float(low_dpk) * float(weight_kg)
+        counts_req = (snr_target_case / (max(k, 1e-12) * max(recon_gain, 1e-12))) ** 2
+        sens = self.system_sensitivity(tracer)
+        t_bed = counts_req / max(A_low * sens, 1e-9) * max(mult_bmi, 1e-12)
+
+        v, t_bed_r = self._round_speed_and_time(t_bed)
+
+        counts_act = self.expected_counts(A_low, t_bed_r, tracer)
+        snr_pred = k * self.snr_from_counts(counts_act, recon_gain)
+        cov_pred = 1.0 / snr_pred if snr_pred > 0 else np.nan
+        feasible = (v > 0.5 + 1e-6)
+
+        time_min = (scan_range_mm / v) / 60.0
+        return A_low, v, t_bed_r, time_min, snr_pred, cov_pred, feasible
+
+    def solve_fast(self, A_eff_mbq: float, k: float, recon_gain: float, mult_bmi: float,
+                   fast_t_ref_s: float, scan_range_mm: float, tracer: str = "FDG"):
+        """
+        Dwell fijo por cama (fast) escalado por BMI UNA VEZ.
+        Reporta SNR lograda.
+        """
+        t_bed_fast = float(fast_t_ref_s) * max(mult_bmi, 1e-12)
+        v, t_bed_r = self._round_speed_and_time(t_bed_fast)
+
+        counts_act = self.expected_counts(A_eff_mbq, t_bed_r, tracer)
+        snr_pred = k * self.snr_from_counts(counts_act, recon_gain)
+        cov_pred = 1.0 / snr_pred if snr_pred > 0 else np.nan
+
+        time_min = (scan_range_mm / v) / 60.0
+        return v, t_bed_r, time_min, snr_pred, cov_pred
+
+    # ----------------------------
+    # Info útil para UI / documentación
+    # ----------------------------
+    @staticmethod
+    def scaling_law_text() -> str:
+        return (
+            "Ley de escala (sin saturación NECR):\n"
+            "t_bed = t_ref · (A_ref / A_eff) · (SNR_target / SNR_ref)^2 · mult_BMI\n"
+            "Equivalente en cuentas: C_req = (SNR_target / (k·gain))^2;  "
+            "t_bed = C_req / (A_eff · sensibilidad_base) · mult_BMI"
+        )
+
+    def get_patient_bmi_category(self, weight_kg: float, height_cm: float) -> str:
+        """Útil solo para reporte (no modifica cálculos)."""
+        if height_cm <= 0:
+            return "normal"
+        bmi = weight_kg / ((height_cm / 100) ** 2)
+        for category, (min_bmi, max_bmi) in self.BMI_CATEGORIES.items():
+            if min_bmi <= bmi < max_bmi:
+                return category
+        return "normal"
