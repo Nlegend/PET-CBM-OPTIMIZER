@@ -1,0 +1,185 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+from datetime import datetime, timedelta
+from physics_module import PETPhysicsModel
+from data_persistence import KFactorStore
+from ui_components import PETUIComponents
+
+# Initialize components
+physics_model = PETPhysicsModel()
+k_store = KFactorStore()
+ui = PETUIComponents(physics_model)
+
+def main():
+    st.set_page_config(page_title="Vision 450", layout="wide")
+    st.title("Vision 450 — Optimización dinámica")
+    st.caption("k calibrado SIN BMI con SNR_ref del sitio. El solver aplica BMI una sola vez. A_eff con decaimiento y residual.")
+
+    # Sidebar configuration
+    config = ui.sidebar_configuration()
+
+    # Inputs
+    tracer_label, weight_kg, height_cm, gender, scan_range_mm = ui.patient_study_inputs()
+    injected_activity_mbq, inj_time_str, start_time_str, residual_mbq = ui.activity_time_inputs()
+
+    # Parse times
+    try:
+        inj_time = datetime.strptime(inj_time_str, "%Y-%m-%d %H:%M")
+        scan_start = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M")
+    except Exception:
+        st.error("Formato de fecha/hora inválido. Use AAAA-MM-DD HH:MM")
+        st.stop()
+
+    # Check if patient is pediatric
+    is_pediatric = (gender == "pediatric")
+    
+    # Derived selections
+    tkey = physics_model.tracer_key(tracer_label)
+    t_ref_std = config['std_fdg_ref'] if tkey=="FDG" else config['std_psma_ref']
+    t_ref_fast = config['fast_fdg_ref'] if tkey=="FDG" else config['fast_psma_ref']
+    snr_ref_site = config['snr_ref_fdg'] if tkey=="FDG" else config['snr_ref_psma']
+    
+    # For pediatric patients, use adjusted SNR targets
+    if is_pediatric:
+        snr_target_case = physics_model.get_pediatric_snr_target(tkey, weight_kg)
+        st.sidebar.info(f"SNR objetivo ajustado para pediatría: {snr_target_case:.1f}")
+    else:
+        snr_target_case = config['snr_target_fdg'] if tkey=="FDG" else config['snr_target_psma']
+    
+    ld_dpk = config['ld_fdg_dpk'] if tkey=="FDG" else config['ld_psma_dpk']
+    ref_dpk = config['ref_dpk_fdg'] if tkey=="FDG" else config['ref_dpk_psma']
+
+    # Effective activity
+    A_eff = physics_model.effective_activity_mbq(injected_activity_mbq, inj_time, scan_start, tracer=tkey, residual_mbq=residual_mbq)
+
+    # BMI multiplier (apply only in solver)
+    bmi = weight_kg / (height_cm/100.0)**2 if height_cm > 0 else 0
+    mult_bmi = physics_model.bmi_multiplier(bmi, tracer=tkey)
+    lbm = physics_model.calculate_lbm(weight_kg, height_cm, gender)
+
+    # A_ref choice for k calibration (toggle)
+    use_Aeff_as_ref = st.sidebar.toggle("Usar actividad EFECTIVA como A_ref (en vez de MBq/kg)", value=False)
+    if use_Aeff_as_ref:
+        A_ref = A_eff
+        k_src = "A_ref = actividad efectiva (inyectada corregida)"
+    else:
+        # For pediatric patients, adjust reference activity
+        if is_pediatric:
+            dose_factor = physics_model.get_pediatric_dose_factor(weight_kg)
+            A_ref = ref_dpk * weight_kg * dose_factor
+            k_src = f"A_ref = {ref_dpk:.2f} MBq/kg × {weight_kg:.1f} kg × {dose_factor:.2f} (pediátrico)"
+        else:
+            A_ref = ref_dpk * weight_kg
+            k_src = f"A_ref = {ref_dpk:.2f} MBq/kg × {weight_kg:.1f} kg"
+
+    # Load site k if requested
+    site_k_summary = k_store.get_site_k_summary(tkey, config['recon_profile'])
+
+    if config['use_site_k'] and site_k_summary is not None:
+        k = site_k_summary[0]  # median
+        k_mode = f"k del sitio (n={site_k_summary[3]}, mediana)"
+    else:
+        k = physics_model.calibrate_k_from_reference(t_ref_std, A_ref, config['recon_gain'], snr_ref_site, tracer=tkey, weight_kg=weight_kg, height_cm=height_cm)
+        k_mode = "k calibrado de referencia (sin BMI)"
+
+    # Compute protocols with pediatric considerations
+    std_v, std_t, std_time, std_snr, std_cov, std_hit = physics_model.solve_standard(
+        A_eff, k, config['recon_gain'], snr_target_case, mult_bmi, scan_range_mm, 
+        is_pediatric=is_pediatric, weight_kg=weight_kg, height_cm=height_cm, tracer=tkey)
+    
+    low_A, low_v, low_t, low_time, low_snr, low_cov, low_ok = physics_model.solve_lowdose(
+        ld_dpk, weight_kg, k, config['recon_gain'], snr_target_case, mult_bmi, scan_range_mm, 
+        is_pediatric=is_pediatric, height_cm=height_cm, tracer=tkey)
+    
+    fast_v, fast_t, fast_time, fast_snr, fast_cov = physics_model.solve_fast(
+        A_eff, k, config['recon_gain'], mult_bmi, t_ref_fast, scan_range_mm, 
+        is_pediatric=is_pediatric, weight_kg=weight_kg, height_cm=height_cm, tracer=tkey)
+
+    # Prepare data for display
+    patient_data = {
+        'weight_kg': weight_kg,
+        'height_cm': height_cm,
+        'bmi': bmi,
+        'lbm': lbm,
+        'gender': gender
+    }
+
+    activity_data = {
+        'A_eff': A_eff,
+        'residual_mbq': residual_mbq,
+        'delta_t': (scan_start-inj_time).total_seconds()/60,
+        'half_life': physics_model.HALF_LIFE_MIN[tkey]
+    }
+
+    recon_data = {
+        'profile': config['recon_profile'],
+        'gain': config['recon_gain'],
+        'k': k,
+        'k_mode': k_mode,
+        'k_src': k_src,
+        't_ref_std': t_ref_std,
+        't_ref_fast': t_ref_fast,
+        'snr_ref_site': snr_ref_site,
+        'snr_target_case': snr_target_case
+    }
+
+    # Display results
+    ui.display_results(patient_data, activity_data, recon_data)
+
+    # Add pediatric-specific notes
+    if is_pediatric and physics_model is not None:
+        age_group = physics_model.get_pediatric_age_group(weight_kg)
+        dose_factor = physics_model.get_pediatric_dose_factor(weight_kg)
+        st.info(f"👶 Consideraciones pediátricas: Grupo de edad estimado '{age_group}', factor de dosis {dose_factor:.2f}x adulto")
+
+    # 3-column presentation
+    colA, colB, colC = st.columns(3)
+
+    with colA:
+        ui.protocol_block("Protocolo ESTÁNDAR", A_eff, std_v, std_t, std_time, std_snr, std_cov,
+              notes=("Ajusta velocidad para SNR objetivo (tras redondeo)."
+                     if std_hit else "Cerca del objetivo; ajuste fino posible."))
+    with colB:
+        ui.protocol_block("Protocolo RÁPIDO", A_eff, fast_v, fast_t, fast_time, fast_snr, fast_cov,
+              notes="Dwell fijo más corto. SNR lograda reportada.")
+    with colC:
+        note = None if low_ok else "Limitado por 0.5 mm/s — SNR lograda puede ser < objetivo."
+        ui.protocol_block("Protocolo BAJA DOSIS", low_A, low_v, low_t, low_time, low_snr, low_cov, notes=note)
+
+    # k store controls
+    add_k, show_summary = ui.k_store_controls()
+    
+    store = k_store.load_store()
+    if add_k:
+        store = k_store.add_k_measurement(store, tkey, config['recon_profile'], k)
+        st.success("k agregada al almacén.")
+    
+    if show_summary:
+        summary = k_store.summarize_k(store, tkey, config['recon_profile'])
+        if summary:
+            st.info(f"{tkey}/{config['recon_profile']}: mediana={summary[0]:.5f}, IQR=({summary[1]:.5f}–{summary[2]:.5f}), n={summary[3]}")
+        else:
+            st.warning("No hay datos almacenados para este trazador/recon.")
+
+    # Session log & CSV export
+    if "runs" not in st.session_state:
+        st.session_state["runs"] = []
+    
+    st.session_state["runs"].append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "tracer": tkey, "recon_profile": config['recon_profile'], "gain": config['recon_gain'],
+        "snr_ref_site": snr_ref_site, "snr_target_case": snr_target_case,
+        "k": k, "A_injected_MBq": injected_activity_mbq, "A_eff_MBq": A_eff, "A_ref_MBq": A_ref,
+        "BMI_mult": mult_bmi, "scan_range_mm": scan_range_mm,
+        "std_speed": std_v, "std_t": std_t, "std_time_min": std_time, "std_snr": std_snr,
+        "fast_speed": fast_v, "fast_t": fast_t, "fast_time_min": fast_time, "fast_snr": fast_snr,
+        "low_A_MBq": low_A, "low_speed": low_v, "low_t": low_t, "low_time_min": low_time, "low_snr": low_snr,
+        "is_pediatric": is_pediatric
+    })
+    
+    ui.session_log_display(st.session_state["runs"])
+
+if __name__ == "__main__":
+    main()
