@@ -1,5 +1,5 @@
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 class PETPhysicsModel:
     def __init__(self):
@@ -65,6 +65,12 @@ class PETPhysicsModel:
             "adolescent": 0.65
         }
 
+        # UPTAKE TIME DEFAULTS (now used as fallbacks)
+        self.DEFAULT_UPTAKE_TIMES = {
+            "FDG": 60,    # minutes
+            "PSMA": 90    # minutes
+        }
+
     def tracer_key(self, name: str) -> str:
         return "PSMA" if "PSMA" in str(name).upper() else "FDG"
 
@@ -77,14 +83,51 @@ class PETPhysicsModel:
         if custom_gain is not None and custom_gain > 0:
             return float(custom_gain)
         # FIXED: Safe access to RECON_PROFILES
-        profile_data = self.RECON_PROFILES.get(profile, {"gain": 1.6})
-        return profile_data["gain"]
+        profile_map = {"EARL": "EARL", "OSEM_TOF": "OSEM_TOF", "HD_PET": "HD_PET"}
+        mapped_profile = profile_map.get(profile, "HD_PET")
+        return self.RECON_PROFILES[mapped_profile]["gain"]
+
+    def calculate_uptake_time_minutes(self, inj_time, scan_start, tracer="FDG"):
+        """
+        Calculate actual uptake time between injection and scan start
+        Returns the actual time difference in minutes
+        """
+        try:
+            # Handle string inputs
+            if isinstance(inj_time, str):
+                inj_time = datetime.strptime(inj_time, "%Y-%m-%d %H:%M")
+            if isinstance(scan_start, str):
+                scan_start = datetime.strptime(scan_start, "%Y-%m-%d %H:%M")
+            
+            # Calculate time difference
+            time_diff = scan_start - inj_time
+            uptake_time_minutes = time_diff.total_seconds() / 60.0
+            
+            # Ensure positive uptake time
+            uptake_time_minutes = max(uptake_time_minutes, 0.0)
+            
+            return uptake_time_minutes
+            
+        except Exception as e:
+            # Fallback to default uptake time if calculation fails
+            default_uptake = self.DEFAULT_UPTAKE_TIMES.get(self.tracer_key(tracer), 60)
+            print(f"Warning: Uptake time calculation failed ({e}). Using default {default_uptake} min.")
+            return float(default_uptake)
 
     def effective_activity_mbq(self, injected_mbq, inj_time, scan_start, tracer="FDG", residual_mbq=0.0):
-        """Corrige la actividad inyectada por decaimiento y residual"""
+        """
+        Corrige la actividad inyectada por decaimiento y residual
+        Now uses actual uptake time calculation
+        """
+        # Calculate actual uptake time
+        uptake_time_min = self.calculate_uptake_time_minutes(inj_time, scan_start, tracer)
+        
+        # Get half-life for tracer
         half_life = self.HALF_LIFE_MIN[self.tracer_key(tracer)]
         lam = np.log(2) / half_life
-        dt_min = max((scan_start - inj_time).total_seconds() / 60.0, 0.0)
+        
+        # Apply decay correction
+        dt_min = max(uptake_time_min, 0.0)
         A0 = max(injected_mbq - residual_mbq, 0.0)
         return A0 * np.exp(-lam * dt_min)
 
@@ -156,28 +199,23 @@ class PETPhysicsModel:
         sens = self.get_system_sensitivity(tracer)
         return activity_mbq * dwell_time_s * sens
 
-    def calculate_snr_from_nec(self, nec, recon_gain=1.0):
+    def calculate_snr_from_nec(self, nec, recon_gain=1.6):
         return np.sqrt(max(nec, 1e-9)) * recon_gain
 
     def calibrate_k_from_reference(self, t_ref_std_s, A_ref_mbq, recon_gain, snr_ref_site, tracer="FDG", weight_kg=70, height_cm=170):
         """
-        Enhanced k calibration using NEC model with LITERATURE-CONFIRMED parameters
+        k estable: calibrado con sensibilidad base y NEC de referencia
         """
-        # Calculate reference NEC using confirmed system sensitivity
-        sensitivity = self.get_system_sensitivity(tracer)
-        nec_ref = A_ref_mbq * t_ref_std_s * sensitivity  # counts
-        
-        # SNR_ref = k * √(NEC_ref) * recon_gain
-        # k = SNR_ref / (√(NEC_ref) * recon_gain)
+        sens = self.get_system_sensitivity(tracer)
+        nec_ref = A_ref_mbq * t_ref_std_s * sens
         sqrt_nec_ref = np.sqrt(max(nec_ref, 1e-9))
         k = snr_ref_site / (sqrt_nec_ref * recon_gain)
-        
         return float(max(k, 1e-9))
 
     # ----------- Solvers de protocolo -----------
 
     def solve_standard(self, A_eff_mbq, k, recon_gain, snr_target_case, mult_bmi, scan_range_mm, 
-                    tracer="FDG", is_pediatric=False, weight_kg=None, height_cm=None):
+                      tracer="FDG", is_pediatric=False, weight_kg=None, height_cm=None):
         nec_req = (snr_target_case / (max(k, 1e-9) * recon_gain)) ** 2
         sens = self.get_system_sensitivity(tracer)
         t_bed = nec_req / (max(A_eff_mbq * sens, 1e-6)) * mult_bmi
@@ -199,7 +237,7 @@ class PETPhysicsModel:
         return v, t_bed_r, (scan_range_mm / v) / 60.0, snr_pred, cov_pred, abs(snr_pred - snr_target_case) <= 0.3
 
     def solve_lowdose(self, low_dpk, weight_kg, k, recon_gain, snr_target_case, mult_bmi, scan_range_mm, 
-                    tracer="FDG", is_pediatric=False, height_cm=None):
+                     tracer="FDG", is_pediatric=False, height_cm=None):
         # PEDIATRIC DOSE ADJUSTMENT
         if is_pediatric:
             dose_factor = self.get_pediatric_dose_factor(weight_kg)
@@ -224,11 +262,12 @@ class PETPhysicsModel:
         nec = self.calculate_nec(A_low, t_bed_r, tracer)
         snr_pred = k * self.calculate_snr_from_nec(nec, recon_gain)
         cov_pred = 1.0 / snr_pred if snr_pred > 0 else np.nan
+        feasible = (v > 0.5 + 1e-6)
 
-        return A_low, v, t_bed_r, (scan_range_mm / v) / 60.0, snr_pred, cov_pred, v > 0.5 + 1e-6
+        return A_low, v, t_bed_r, (scan_range_mm / v) / 60.0, snr_pred, cov_pred, feasible
 
     def solve_fast(self, A_eff_mbq, k, recon_gain, mult_bmi, fast_t_ref_s, scan_range_mm, 
-                tracer="FDG", is_pediatric=False, weight_kg=None, height_cm=None):
+                  tracer="FDG", is_pediatric=False, weight_kg=None, height_cm=None):
         t_bed_fast = float(fast_t_ref_s) * mult_bmi
 
         # PEDIATRIC FAST PROTOCOL ADJUSTMENT
